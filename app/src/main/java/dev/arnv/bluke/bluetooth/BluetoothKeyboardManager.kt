@@ -64,6 +64,14 @@ class BluetoothKeyboardManager(private val context: Context) {
         }, "bt-report-sender")
     }
 
+    private val mouseSenderLock = Any()
+    private var pendingMouseReport: ByteArray? = null
+    private var isMouseSenderActive = false
+
+    private val gamepadSenderLock = Any()
+    private var pendingGamepadReport: ByteArray? = null
+    private var isGamepadSenderActive = false
+
     private val reportDiagnostics = HidReportDiagnostics()
 
     private fun logHidEvent(event: String) {
@@ -1653,14 +1661,54 @@ class BluetoothKeyboardManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun sendMouseReport(buttons: Byte, x: Byte, y: Byte, wheel: Byte) {
-        val dev = _connectedDevice.value
-        if (dev != null) {
-            val report = ByteArray(4)
-            report[0] = buttons
-            report[1] = x
-            report[2] = y
-            report[3] = wheel
-            submitReport(dev, 2, report) // Mouse report ID is 2
+        val dev = _connectedDevice.value ?: return
+        val hid = hidDeviceProfile ?: return
+        if (closed) return
+
+        synchronized(mouseSenderLock) {
+            val prev = pendingMouseReport
+            if (prev != null) {
+                // Keep the latest button mask, and accumulate movement deltas
+                val newX = (prev[1] + x).coerceIn(-127, 127).toByte()
+                val newY = (prev[2] + y).coerceIn(-127, 127).toByte()
+                val newWheel = (prev[3] + wheel).coerceIn(-127, 127).toByte()
+                pendingMouseReport = byteArrayOf(buttons, newX, newY, newWheel)
+            } else {
+                pendingMouseReport = byteArrayOf(buttons, x, y, wheel)
+            }
+            if (isMouseSenderActive) return
+            isMouseSenderActive = true
+        }
+
+        val epoch = connectionEpoch.get()
+        try {
+            reportExecutor.submit {
+                try {
+                    while (true) {
+                        val report: ByteArray
+                        synchronized(mouseSenderLock) {
+                            report = pendingMouseReport ?: run {
+                                isMouseSenderActive = false
+                                return@submit
+                            }
+                            pendingMouseReport = null
+                        }
+                        if (closed || epoch != connectionEpoch.get() || _connectedDevice.value?.address != dev.address) {
+                            synchronized(mouseSenderLock) { isMouseSenderActive = false }
+                            return@submit
+                        }
+                        try {
+                            hid.sendReport(dev, 2, report)
+                        } catch (e: Exception) {
+                            Log.e("BluetoothKeyboard", "Error transmitting mouse report", e)
+                        }
+                    }
+                } finally {
+                    synchronized(mouseSenderLock) { isMouseSenderActive = false }
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            synchronized(mouseSenderLock) { isMouseSenderActive = false }
         }
     }
 
@@ -1678,22 +1726,68 @@ class BluetoothKeyboardManager(private val context: Context) {
         if (registeredGamepadMode?.let {
                 requiresGamepadDescriptorRestart(it, gamepadDpadOutputMode)
             } != false) return
-        val dev = _connectedDevice.value
-        if (dev != null) {
-            val report = buildGamepadReport(
-                buttonMask,
-                dpadMask,
-                leftXFloat,
-                leftYFloat,
-                rightXFloat,
-                rightYFloat,
-                gamepadDpadOutputMode,
-            )
-            submitReport(dev, 3, report) // Gamepad report ID is 3
+        val dev = _connectedDevice.value ?: return
+        val hid = hidDeviceProfile ?: return
+        if (closed) return
+
+        val report = buildGamepadReport(
+            buttonMask,
+            dpadMask,
+            leftXFloat,
+            leftYFloat,
+            rightXFloat,
+            rightYFloat,
+            gamepadDpadOutputMode,
+        )
+
+        synchronized(gamepadSenderLock) {
+            // Always overwrite with the freshest state: never backlog stale analog/button positions
+            pendingGamepadReport = report
+            if (isGamepadSenderActive) return
+            isGamepadSenderActive = true
+        }
+
+        val epoch = connectionEpoch.get()
+        val reportMode = gamepadDpadOutputMode
+        try {
+            reportExecutor.submit {
+                try {
+                    while (true) {
+                        val reportToSend: ByteArray
+                        synchronized(gamepadSenderLock) {
+                            reportToSend = pendingGamepadReport ?: run {
+                                isGamepadSenderActive = false
+                                return@submit
+                            }
+                            pendingGamepadReport = null
+                        }
+                        if (closed || epoch != connectionEpoch.get() || _connectedDevice.value?.address != dev.address) {
+                            synchronized(gamepadSenderLock) { isGamepadSenderActive = false }
+                            return@submit
+                        }
+                        try {
+                            val accepted = hid.sendReport(dev, 3, reportToSend)
+                            if (DeveloperLogManager.isEnabled) {
+                                reportDiagnostics.record(3, accepted, android.os.SystemClock.elapsedRealtime())?.let { summary ->
+                                    val axes = gamepadAxisDiagnostic(reportToSend)
+                                    val message = "sendReport ID=0x03 $summary mode=$reportMode epoch=$epoch $axes " +
+                                        "Data=[${reportToSend.joinToString(" ") { String.format("%02X", it) }}]"
+                                    Log.d("BlukeHID", message)
+                                    DeveloperLogManager.log("BlukeHID", message, LogType.BLUETOOTH_PACKET)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e("BluetoothKeyboard", "Error transmitting gamepad report", e)
+                        }
+                    }
+                } finally {
+                    synchronized(gamepadSenderLock) { isGamepadSenderActive = false }
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            synchronized(gamepadSenderLock) { isGamepadSenderActive = false }
         }
     }
-
-
 
     fun resetKeyboardState() {
         synchronized(activeKeys) {
@@ -1705,6 +1799,14 @@ class BluetoothKeyboardManager(private val context: Context) {
     /** Release input without tearing down the Bluetooth session when its UI leaves foreground. */
     fun releaseAllInputs() {
         connectionEpoch.incrementAndGet() // Discard held-input reports that have not been sent yet.
+        synchronized(mouseSenderLock) {
+            pendingMouseReport = null
+            isMouseSenderActive = false
+        }
+        synchronized(gamepadSenderLock) {
+            pendingGamepadReport = null
+            isGamepadSenderActive = false
+        }
         resetKeyboardState()
         val device = _connectedDevice.value ?: return
         submitReport(device, reportId, ByteArray(8))

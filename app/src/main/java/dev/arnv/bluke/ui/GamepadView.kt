@@ -1233,15 +1233,18 @@ fun Modifier.gamepadButtonTouch(
             currentOnPressedStateChange(true)
             currentOnPress()
             down.consume()
-            while (true) {
-                val event = awaitPointerEvent()
-                val change = event.changes.firstOrNull { it.id == targetPointerId } ?: break
-                if (!change.pressed) {
-                    currentOnPressedStateChange(false)
-                    currentOnRelease()
-                    break
+            try {
+                while (true) {
+                    val event = awaitPointerEvent()
+                    val change = event.changes.firstOrNull { it.id == targetPointerId }
+                    if (change == null || !change.pressed) {
+                        break
+                    }
+                    change.consume()
                 }
-                change.consume()
+            } finally {
+                currentOnPressedStateChange(false)
+                currentOnRelease()
             }
         }
     }
@@ -1610,13 +1613,16 @@ private fun FaceButtonsDiamond(
     val spacing = 40.dp
     val density = LocalDensity.current.density
 
+    val currentOnPress by rememberUpdatedState(onPress)
+    val currentOnRelease by rememberUpdatedState(onRelease)
+
     // Track active pressed button mapping IDs via proximity multi-touch
     val activePressedButtons = remember { mutableStateListOf<Int>() }
 
     val updateProximityPresses = { pointerPositions: List<Offset>, containerSizePx: Float ->
         val centerPx = containerSizePx / 2f
         val spacingPx = 40f * density
-        val touchRadiusPx = 35f * density // Proximity radius covering multi-button thumb presses
+        val touchRadiusPx = 22f * density // Proximity radius accurately targeting individual buttons
 
         val topCenter = Offset(centerPx, centerPx - spacingPx)
         val rightCenter = Offset(centerPx + spacingPx, centerPx)
@@ -1646,7 +1652,7 @@ private fun FaceButtonsDiamond(
         for (mappingId in newlyActive) {
             if (!activePressedButtons.contains(mappingId)) {
                 activePressedButtons.add(mappingId)
-                onPress(mappingId)
+                currentOnPress(mappingId)
             }
         }
 
@@ -1655,7 +1661,7 @@ private fun FaceButtonsDiamond(
         for (mappingId in activePressedButtons) {
             if (!newlyActive.contains(mappingId)) {
                 toRemove.add(mappingId)
-                onRelease(mappingId)
+                currentOnRelease(mappingId)
             }
         }
         activePressedButtons.removeAll(toRemove.toSet())
@@ -1671,23 +1677,26 @@ private fun FaceButtonsDiamond(
                     activePositions[down.id] = down.position
                     updateProximityPresses(activePositions.values.toList(), size.width.toFloat())
 
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        for (change in event.changes) {
-                            if (change.pressed) {
-                                activePositions[change.id] = change.position
-                            } else {
-                                activePositions.remove(change.id)
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            for (change in event.changes) {
+                                if (change.pressed) {
+                                    activePositions[change.id] = change.position
+                                } else {
+                                    activePositions.remove(change.id)
+                                }
                             }
-                        }
-                        if (activePositions.isEmpty()) {
-                            for (id in activePressedButtons.toList()) {
-                                onRelease(id)
+                            if (activePositions.isEmpty()) {
+                                break
                             }
-                            activePressedButtons.clear()
-                            break
+                            updateProximityPresses(activePositions.values.toList(), size.width.toFloat())
                         }
-                        updateProximityPresses(activePositions.values.toList(), size.width.toFloat())
+                    } finally {
+                        for (id in activePressedButtons.toList()) {
+                            currentOnRelease(id)
+                        }
+                        activePressedButtons.clear()
                     }
                 }
             },
@@ -2345,27 +2354,31 @@ private fun GamepadAnalogStick(
 
                         updateStickOffset(down.position)
 
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == pointerId } ?: break
+                        try {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == pointerId }
+                                if (change == null || !change.pressed) {
+                                    if (change != null) {
+                                        val dragDistance = sqrt((change.position.x - down.position.x) * (change.position.x - down.position.x) + 
+                                                                (change.position.y - down.position.y) * (change.position.y - down.position.y))
 
-                            if (!change.pressed) {
-                                val dragDistance = sqrt((change.position.x - down.position.x) * (change.position.x - down.position.x) + 
-                                                        (change.position.y - down.position.y) * (change.position.y - down.position.y))
-
-                                if (dragDistance < tapSlopPx && System.currentTimeMillis() - downTime < 250) {
-                                    if (!currentIsHeld) {
-                                        currentOnStickClick()
+                                        if (dragDistance < tapSlopPx && System.currentTimeMillis() - downTime < 250) {
+                                            if (!currentIsHeld) {
+                                                currentOnStickClick()
+                                            }
+                                        }
                                     }
+                                    break
                                 }
-                                stickOffsetX = 0f
-                                stickOffsetY = 0f
-                                currentOnMove(0f, 0f)
-                                break
-                            }
 
-                            change.consume()
-                            updateStickOffset(change.position)
+                                change.consume()
+                                updateStickOffset(change.position)
+                            }
+                        } finally {
+                            stickOffsetX = 0f
+                            stickOffsetY = 0f
+                            currentOnMove(0f, 0f)
                         }
                     }
                 },
@@ -2562,26 +2575,29 @@ private fun GamepadDpad(
                     activeDirection = currentBit
                     currentOnDpadChange(currentBit)
 
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == targetPointerId } ?: break
-                        if (!change.pressed) {
-                            activeDirection = 0
-                            currentOnDpadChange(0)
-                            break
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == targetPointerId }
+                            if (change == null || !change.pressed) {
+                                break
+                            }
+                            change.consume()
+                            val newBit = determineDpadBit(
+                                change.position.x,
+                                change.position.y,
+                                size.width.toFloat(),
+                                size.height.toFloat(),
+                            )
+                            if (newBit != currentBit) {
+                                currentBit = newBit
+                                activeDirection = currentBit
+                                currentOnDpadChange(currentBit)
+                            }
                         }
-                        change.consume()
-                        val newBit = determineDpadBit(
-                            change.position.x,
-                            change.position.y,
-                            size.width.toFloat(),
-                            size.height.toFloat(),
-                        )
-                        if (newBit != currentBit) {
-                            currentBit = newBit
-                            activeDirection = currentBit
-                            currentOnDpadChange(currentBit)
-                        }
+                    } finally {
+                        activeDirection = 0
+                        currentOnDpadChange(0)
                     }
                 }
             }

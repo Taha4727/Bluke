@@ -989,6 +989,9 @@ fun TouchGestureLayer(
                             }
                         }
 
+                        // Consume pointer changes to avoid gestures fighting with window or parent containers
+                        changes.forEach { it.consume() }
+
                         if (downCount == 0) {
                             maxPointersInTap = 0
                         }
